@@ -17,6 +17,10 @@ from modules.utilities import is_image, is_video, resolve_relative_path
 import queue
 import threading
 import time
+try:
+    import pyvirtualcam
+except ImportError:
+    pyvirtualcam = None
 ROOT = None
 ROOT_HEIGHT = 700
 ROOT_WIDTH = 800
@@ -34,9 +38,18 @@ preview_slider = None
 source_label = None
 target_label = None
 status_label = None
+text_box_addr_in = None
+text_box_addr_out = None
+text_box_addr_out_t = None
 
 img_ft, vid_ft = modules.globals.file_types
 frames_array =[]
+MAX_PENDING_FRAMES = 5
+FIRST_FRAME_TIMEOUT_S = 25
+VIRTUAL_CAM = None
+VIRTUAL_CAM_FAILED = False
+VIRTUAL_CAM_FPS = 30
+VIRTUAL_CAM_ENABLED = os.environ.get('DLC_VIRTUAL_CAM', '1') != '0'
 
 def init(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.CTk:
     global ROOT, PREVIEW
@@ -47,6 +60,7 @@ def init(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.CTk:
     return ROOT
 def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.CTk:
     global source_label, target_label, status_label
+    global text_box_addr_in, text_box_addr_out, text_box_addr_out_t
 
     ctk.deactivate_automatic_dpi_awareness()
     ctk.set_appearance_mode('system')
@@ -454,30 +468,168 @@ def update_preview(frame_number: int = 0) -> None:
         image = ctk.CTkImage(image, size=image.size)
         preview_label.configure(image=image)
 terminate_flag = threading.Event() 
-def send_streams(cap:cv2.VideoCapture,input_queue:queue.Queue,remote_modules:List[ModuleType],stream_out:Any):
+STREAM_RESTART_DELAY_S = 1.0
+STALE_FRAME_NOTICE_S = 2.0
+def stop_stream_process(process:Any) -> None:
+    """
+    Hentikan satu proses ffmpeg streaming tanpa melempar error bila sudah mati.
+
+    @param {Any} process - proses ffmpeg push atau pull yang akan dihentikan.
+    @returns {None}
+    """
+    if process is None:
+        return
     try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Cutting cam...")
-                break
-            temp_frame = frame.copy() 
-            #input_queue.put(temp_frame)
-            remote_modules[1].write_to_stdin(temp_frame,input_queue,stream_out)
-    finally:
-        cap.release()
-        stream_out.terminate()
-        print("Stream out terminated.")
-def receive_frames(output_queue:queue.Queue,remote_modules:List[ModuleType],stream_in:Any):
+        process.terminate()
+        process.wait(timeout=2)
+        return
+    except Exception:
+        pass
     try:
-        while True:
-            remote_modules[1].read_from_stdout(stream_in,output_queue)
-            while not output_queue.empty():
-                item = output_queue.get()
-                frames_array.append(item)
-    finally:
-        stream_in.terminate()  
-        print("Stream in terminated.") 
+        process.kill()
+    except Exception:
+        pass
+def create_virtual_camera(width: int, height: int) -> Any:
+    """
+    Buka OBS Virtual Camera untuk ukuran frame tertentu memakai pyvirtualcam.
+
+    @param {int} width - lebar frame dalam piksel.
+    @param {int} height - tinggi frame dalam piksel.
+    @returns {Any} objek kamera pyvirtualcam, atau None bila belum terpasang atau gagal dibuka.
+    """
+    global VIRTUAL_CAM_FAILED
+    if pyvirtualcam is None:
+        VIRTUAL_CAM_FAILED = True
+        print("[VCAM] pyvirtualcam belum terpasang, jalankan: venv\\Scripts\\pip install pyvirtualcam")
+        return None
+    try:
+        camera = pyvirtualcam.Camera(width=width, height=height, fps=VIRTUAL_CAM_FPS, fmt=pyvirtualcam.PixelFormat.BGR)
+        print("[VCAM] kamera virtual aktif " + str(width) + "x" + str(height) + " backend=" + str(camera.backend))
+        return camera
+    except Exception as error:
+        VIRTUAL_CAM_FAILED = True
+        print("[VCAM] gagal membuka kamera virtual " + type(error).__name__ + ": " + str(error))
+        return None
+def close_virtual_camera() -> None:
+    """
+    Tutup kamera virtual agar device OBS dilepas saat aplikasi berhenti atau ukuran frame berubah.
+
+    @returns {None}
+    """
+    global VIRTUAL_CAM
+    if VIRTUAL_CAM is None:
+        return
+    try:
+        VIRTUAL_CAM.close()
+    except Exception:
+        pass
+    VIRTUAL_CAM = None
+def push_virtual_camera(frame: Any) -> None:
+    """
+    Kirim satu frame BGR ke kamera virtual dan buat ulang kamera bila ukuran frame berubah.
+
+    @param {Any} frame - frame BGR hasil pemrosesan yang akan dikirim ke OBS Virtual Camera.
+    @returns {None}
+    """
+    global VIRTUAL_CAM
+    if not VIRTUAL_CAM_ENABLED or VIRTUAL_CAM_FAILED or frame is None:
+        return
+    height, width = frame.shape[:2]
+    if VIRTUAL_CAM is None or VIRTUAL_CAM.width != width or VIRTUAL_CAM.height != height:
+        close_virtual_camera()
+        VIRTUAL_CAM = create_virtual_camera(width, height)
+    if VIRTUAL_CAM is None:
+        return
+    try:
+        VIRTUAL_CAM.send(frame)
+    except Exception as error:
+        print("[VCAM] kirim frame gagal " + type(error).__name__ + ": " + str(error))
+        close_virtual_camera()
+def send_streams(cap:cv2.VideoCapture,input_queue:queue.Queue,remote_modules:List[ModuleType],handles:dict):
+    """
+    Kirim frame kamera ke ffmpeg push dan hidupkan ulang prosesnya saat pipa putus.
+
+    @param {cv2.VideoCapture} cap - webcam lokal yang dibaca terus-menerus.
+    @param {queue.Queue} input_queue - antrean pendukung pipeline lokal.
+    @param {List[ModuleType]} remote_modules - modul remote_processor yang aktif.
+    @param {dict} handles - wadah proses ffmpeg push agar bisa diganti dari thread ini.
+    @returns {None}
+    """
+    last_spawn_at = 0.0
+    while not terminate_flag.is_set():
+        if handles['out'] is None or handles['out'].poll() is not None:
+            elapsed = time.time() - last_spawn_at
+            if elapsed < STREAM_RESTART_DELAY_S:
+                time.sleep(STREAM_RESTART_DELAY_S - elapsed)
+            handles['out'] = remote_modules[1].send_streams(cap)
+            last_spawn_at = time.time()
+            print("[LIVE] ffmpeg push ke Out T dijalankan")
+        ret, frame = cap.read()
+        if not ret:
+            print("Cutting cam...")
+            break
+        if remote_modules[1].write_to_stdin(frame, input_queue, handles['out']):
+            continue
+        print("[LIVE] pipe Out T putus, ffmpeg push dijalankan ulang")
+        stop_stream_process(handles['out'])
+        handles['out'] = None
+        time.sleep(STREAM_RESTART_DELAY_S)
+def receive_frames(output_queue:queue.Queue,remote_modules:List[ModuleType],handles:dict):
+    """
+    Baca frame hasil dari ffmpeg pull dan hidupkan ulang prosesnya saat stream berhenti.
+
+    @param {queue.Queue} output_queue - antrean frame hasil decode ffmpeg pull.
+    @param {List[ModuleType]} remote_modules - modul remote_processor yang aktif.
+    @param {dict} handles - wadah proses ffmpeg pull agar bisa diganti dari thread ini.
+    @returns {None}
+    """
+    last_spawn_at = 0.0
+    while not terminate_flag.is_set():
+        if handles['in'] is None or handles['in'].poll() is not None:
+            elapsed = time.time() - last_spawn_at
+            if elapsed < STREAM_RESTART_DELAY_S:
+                time.sleep(STREAM_RESTART_DELAY_S - elapsed)
+            handles['in'] = remote_modules[1].recieve_streams(None)
+            last_spawn_at = time.time()
+            print("[LIVE] ffmpeg pull dari In dijalankan")
+        if not remote_modules[1].read_from_stdout(handles['in'], output_queue):
+            print("[LIVE] stream In berhenti, ffmpeg pull dijalankan ulang")
+            stop_stream_process(handles['in'])
+            handles['in'] = None
+            frames_array.clear()
+            output_queue.queue.clear()
+            time.sleep(STREAM_RESTART_DELAY_S)
+            continue
+        while not output_queue.empty():
+            frames_array.append(output_queue.get())
+        if len(frames_array) > MAX_PENDING_FRAMES:
+            del frames_array[:-MAX_PENDING_FRAMES]
+
+def sync_addresses() -> bool:
+    """
+    Salin isi kotak In, Out S, dan Out T ke globals supaya Live memakai alamat yang terlihat di layar.
+
+    @returns {bool} True ketika ketiga alamat terisi dan In tidak sama dengan Out T.
+    """
+    bindings = (
+        (text_box_addr_in, 'pull_addr'),
+        (text_box_addr_out, 'push_addr'),
+        (text_box_addr_out_t, 'push_addr_two')
+    )
+    for widget, attribute in bindings:
+        if widget is not None:
+            setattr(modules.globals, attribute, widget.get('1.0', tk.END).strip())
+    print(f"[LIVE] In (baca hasil)       : {modules.globals.pull_addr}")
+    print(f"[LIVE] Out S (upload source) : {modules.globals.push_addr}")
+    print(f"[LIVE] Out T (kirim kamera)  : {modules.globals.push_addr_two}")
+    if not modules.globals.pull_addr or not modules.globals.push_addr or not modules.globals.push_addr_two:
+        print("Alamat In/Out S/Out T belum lengkap. Tempel ketiganya dari blok alamat di Colab, lalu tekan Live lagi.")
+        return False
+    if modules.globals.pull_addr == modules.globals.push_addr_two:
+        print("Alamat In dan Out T sama. In adalah tunnel 5557 dan Out T adalah tunnel 5556, lihat blok alamat di Colab.")
+        return False
+    return True
+
 
 def webcam_preview():
     if modules.globals.source_path is None:
@@ -486,7 +638,14 @@ def webcam_preview():
 
     global preview_label, PREVIEW
 
+    if not sync_addresses():
+        return
+
     cap = cv2.VideoCapture(0)  # Use index for the webcam (adjust the index accordingly if necessary)    
+    if not cap.isOpened():
+        print("Webcam could not be opened. Close other apps using the camera and try again.")
+        PREVIEW.withdraw()
+        return
     cap.set(cv2.CAP_PROP_BUFFERSIZE,3)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)  # Set the width of the resolution
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)  # Set the height of the resolution
@@ -509,49 +668,82 @@ def webcam_preview():
         print(f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
         remote_modules = get_frame_processors_modules(['remote_processor'])
         source_data = cv2.imread(modules.globals.source_path)
-        remote_modules[1].send_source_frame(source_data)
+        if source_data is None:
+            print("Source face image could not be read. Select the source face again.")
+            cap.release()
+            PREVIEW.withdraw()
+            return
+        if not remote_modules[1].send_source_frame(source_data):
+            print("Remote Colab server is not responding. Restart the Colab cell and update the tunnel addresses.")
+            cap.release()
+            PREVIEW.withdraw()
+            return
         #start ffmpeg stream out subprocess
         stream_out = remote_modules[1].send_streams(cap)
         #start ffmpeg stream In subprocess
         stream_in = remote_modules[1].recieve_streams(cap)
+        stream_handles = {'out': stream_out, 'in': stream_in}
         remote_process = True
         input_queue = queue.Queue()
         output_queue = queue.Queue()
         
-        thread_stream = threading.Thread(target=send_streams,args=(cap,input_queue,remote_modules,stream_out,))
+        thread_stream = threading.Thread(target=send_streams,args=(cap,input_queue,remote_modules,stream_handles,),daemon=True)
         thread_stream.start()
 
-        thread_stream_in = threading.Thread(target=receive_frames,args=(output_queue,remote_modules,stream_in,))
+        thread_stream_in = threading.Thread(target=receive_frames,args=(output_queue,remote_modules,stream_handles,),daemon=True)
         thread_stream_in.start()
         global frames_array
+        frames_array.clear()
+        terminate_flag.clear()
+        frame_deadline = time.time() + FIRST_FRAME_TIMEOUT_S
+        received_frame = False
+        last_frame_at = time.time()
+        stream_window_visible = True
         try:
             while True:
                 if len(frames_array) > 0:
-                    frame = frames_array[-1]  # Display the latest frame
-                    cv2.imshow("Processed Stream", frame)
-                    
-                    if cv2.waitKey(1) & 0xFF == ord("x"):
-                        print("Exiting Program...")
-                        terminate_flag.set()
-                        break
-                    
+                    received_frame = True
+                    last_frame_at = time.time()
+                    stream_window_visible = True
+                    cv2.imshow("Processed Stream", frames_array[-1])
+                    push_virtual_camera(frames_array[-1])
                     if len(frames_array) > 1:
                         frames_array.pop(0)
+                else:
+                    time.sleep(0.001)
+                    if not received_frame and time.time() > frame_deadline:
+                        print("No frame received from the Colab server. Check the 'In' and 'Out T' tunnel addresses.")
+                        break
+                    if received_frame and stream_window_visible and time.time() - last_frame_at > STALE_FRAME_NOTICE_S:
+                        try:
+                            cv2.destroyWindow("Processed Stream")
+                        except cv2.error:
+                            pass
+                        stream_window_visible = False
+                        print("[LIVE] frame berhenti, menunggu stream pulih...")
+                ROOT.update()
+                if cv2.waitKey(1) & 0xFF in (ord("x"), ord("q")):
+                    print("Exiting Program...")
+                    terminate_flag.set()
+                    break
+                if PREVIEW.state() == 'withdrawn':
+                    terminate_flag.set()
+                    break
         finally:
             terminate_flag.set()  # Signal threads to stop
+            close_virtual_camera()
             print("Terminating FFmpeg subprocesses...")
-            stream_out.terminate()
-            stream_out.kill()  # Ensure termination
-            stream_in.terminate()
-            stream_in.kill()
+            stop_stream_process(stream_handles['out'])
+            stop_stream_process(stream_handles['in'])
             print("Terminating threads...")
-            thread_stream.join()
-            thread_stream_in.join()
+            thread_stream.join(timeout=3)
+            thread_stream_in.join(timeout=3)
 
             print("Releasing resources...")
             cap.release()  # Release webcam
             input_queue.queue.clear()
             output_queue.queue.clear()
+            cv2.destroyAllWindows()
             PREVIEW.withdraw()  # Close preview window when loop is finished
             
     else:
@@ -576,10 +768,12 @@ def webcam_preview():
                 image = ImageOps.contain(image, (PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT), Image.LANCZOS)
                 image = ctk.CTkImage(image, size=image.size)
                 preview_label.configure(image=image)
+                push_virtual_camera(temp_frame)
                 ROOT.update()
                   
                 if PREVIEW.state() == 'withdrawn':
                     break
         finally:
+            close_virtual_camera()
             cap.release()
             PREVIEW.withdraw()  # Close preview window when loop is finished
