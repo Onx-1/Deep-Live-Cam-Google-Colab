@@ -50,6 +50,7 @@ VIRTUAL_CAM = None
 VIRTUAL_CAM_FAILED = False
 VIRTUAL_CAM_FPS = 30
 VIRTUAL_CAM_ENABLED = os.environ.get('DLC_VIRTUAL_CAM', '1') != '0'
+REMOTE_LIVE_RUNNING = threading.Event()
 
 def init(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.CTk:
     global ROOT, PREVIEW
@@ -348,9 +349,15 @@ def update_tumbler(var: str, value: bool) -> None:
 
 
 def select_source_path() -> None:
+    """
+    Pilih gambar wajah sumber; saat Live remote berjalan jendela preview dibiarkan terbuka agar sesi tidak terputus.
+
+    @returns {None}
+    """
     global RECENT_DIRECTORY_SOURCE, img_ft, vid_ft
 
-    PREVIEW.withdraw()
+    if not REMOTE_LIVE_RUNNING.is_set():
+        PREVIEW.withdraw()
     source_path = ctk.filedialog.askopenfilename(title='select an source image', initialdir=RECENT_DIRECTORY_SOURCE, filetypes=[img_ft])
     if is_image(source_path):
         modules.globals.source_path = source_path
@@ -631,6 +638,29 @@ def sync_addresses() -> bool:
     return True
 
 
+def push_source_change(remote_modules: List[ModuleType], source_path: str, source_state: dict) -> None:
+    """
+    Kirim gambar wajah sumber baru ke Colab tanpa memutus sesi Live yang sedang berjalan.
+
+    @param {List[ModuleType]} remote_modules - modul remote_processor yang sedang dipakai.
+    @param {str} source_path - path gambar wajah sumber yang baru dipilih.
+    @param {dict} source_state - penanda path terakhir yang sudah dikirim ke Colab.
+    @returns {None}
+    """
+    try:
+        source_data = cv2.imread(source_path)
+        if source_data is None:
+            print("[LIVE] gambar source baru tidak bisa dibaca, wajah lama tetap dipakai")
+            return
+        if remote_modules[1].send_source_frame(source_data):
+            print("[LIVE] wajah source diganti tanpa restart: " + os.path.basename(source_path))
+            return
+        print("[LIVE] gagal mengirim wajah source baru, wajah lama tetap dipakai")
+    finally:
+        source_state['path'] = source_path
+        source_state['pending'] = False
+
+
 def webcam_preview():
     if modules.globals.source_path is None:
         # No image selected
@@ -695,12 +725,18 @@ def webcam_preview():
         global frames_array
         frames_array.clear()
         terminate_flag.clear()
+        REMOTE_LIVE_RUNNING.set()
+        source_state = {'path': modules.globals.source_path, 'pending': False}
         frame_deadline = time.time() + FIRST_FRAME_TIMEOUT_S
         received_frame = False
         last_frame_at = time.time()
         stream_window_visible = True
         try:
             while True:
+                current_source = modules.globals.source_path
+                if current_source and not source_state['pending'] and current_source != source_state['path']:
+                    source_state['pending'] = True
+                    threading.Thread(target=push_source_change, args=(remote_modules, current_source, source_state), daemon=True).start()
                 if len(frames_array) > 0:
                     received_frame = True
                     last_frame_at = time.time()
@@ -731,6 +767,7 @@ def webcam_preview():
                     break
         finally:
             terminate_flag.set()  # Signal threads to stop
+            REMOTE_LIVE_RUNNING.clear()
             close_virtual_camera()
             print("Terminating FFmpeg subprocesses...")
             stop_stream_process(stream_handles['out'])

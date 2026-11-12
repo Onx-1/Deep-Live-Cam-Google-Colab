@@ -175,7 +175,7 @@ Just follow the clicks on the screenshot
 ![demo-gif](colab_demo.gif)
 Just use your favorite screencapture to stream like OBS
 
-> Note: In case you want to change your face, just select another picture, the preview mode will then restart (so just wait a bit).
+> Note: In case you want to change your face, just select another picture. When remote Live is running the new source face is pushed to Colab mid-stream (hot-swap: the stream, camera and virtual camera keep running, the face changes within about a second). In local Preview mode the preview simply reloads, so just wait a bit.
 
 Additional command line arguments are given below. To learn out what they do, check [this guide](https://github.com/s0md3v/roop/wiki/Advanced-Options).
 

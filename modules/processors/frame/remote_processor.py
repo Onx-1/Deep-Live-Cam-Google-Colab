@@ -24,6 +24,7 @@ STREAM_FRAME_SIZE = STREAM_WIDTH * STREAM_HEIGHT * STREAM_CHANNELS
 context = zmq.Context()
 SOCKET_TIMEOUT_MS = 15000
 RECEIVE_TIMEOUT_S = 20
+SOURCE_UPLOAD_LOCK = threading.Lock()
 
 
 def configure_socket(socket: zmq.Socket) -> zmq.Socket:
@@ -124,19 +125,27 @@ def send_source_frame(source_face: Frame) -> bool:
     """
     Send the source face image to the Colab server.
 
+    Bisa dipanggil ulang saat Live berjalan agar Colab memakai wajah sumber yang baru.
+
     @param {Frame} source_face - source face image loaded from disk.
     @returns {bool} True when the server acknowledged the source payload.
     """
-    sender = push_socket(modules.globals.push_addr)
-    source_face_bytes = source_face.tobytes()
-    metadata = {
-            'manyface':(modules.globals.many_faces),
-            'dtype_source':str(source_face.dtype),
-            'shape_source':source_face.shape,
-            'size':'640x480',
-            'fps':'60'
-        }
-    return send_data(sender, source_face_bytes, metadata, modules.globals.push_addr)
+    if not SOURCE_UPLOAD_LOCK.acquire(blocking=False):
+        print('[REMOTE] upload source sebelumnya belum selesai, permintaan ini dilewati.')
+        return False
+    try:
+        sender = push_socket(modules.globals.push_addr)
+        source_face_bytes = source_face.tobytes()
+        metadata = {
+                'manyface':(modules.globals.many_faces),
+                'dtype_source':str(source_face.dtype),
+                'shape_source':source_face.shape,
+                'size':'640x480',
+                'fps':'60'
+            }
+        return send_data(sender, source_face_bytes, metadata, modules.globals.push_addr)
+    finally:
+        SOURCE_UPLOAD_LOCK.release()
 
 def send_temp_frame(temp_face: Frame)-> None:
     sender = push_socket(modules.globals.push_addr_two)
